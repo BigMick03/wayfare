@@ -137,6 +137,9 @@ func (m DepthMetric) RunExecutable(ctx context.Context, s Subject) MetricResult 
 	for _, size := range sizes {
 		path, err := m.DEX.BestPath(ctx, s.Send, size, s.Receive)
 		if err != nil {
+			if strings.Contains(err.Error(), "no path found") {
+				continue // no liquidity at this size, not a probe failure
+			}
 			probeErrors = append(probeErrors, fmt.Sprintf("size=%s: %v", size, err))
 			continue
 		}

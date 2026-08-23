@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -762,20 +761,26 @@ func TestErrorBodyIsBounded(t *testing.T) {
 
 // spread metric ------------------------------------------------------------------
 
-func TestSpreadMetricFromRecordedBook(t *testing.T) {
-	raw, err := os.ReadFile("../dex/testdata/orderbook-xlm-ngnc.json")
-	if err != nil {
-		t.Fatalf("reading recorded order book: %v", err)
+// loadOrderBookSnapshot loads a snapshot from checks/testdata/snapshots by prefix.
+func loadOrderBookSnapshot(t *testing.T, prefix string) *snapshot.Manifest {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join("testdata/snapshots", prefix+"-*"))
+	if err != nil || len(matches) == 0 {
+		t.Fatalf("no snapshot matching %q under testdata/snapshots (err=%v)", prefix, err)
 	}
+	m, err := snapshot.Load(matches[0])
+	if err != nil {
+		t.Fatalf("loading snapshot %s: %v", matches[0], err)
+	}
+	return m
+}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/hal+json")
-		w.Write([]byte(raw))
-	}))
-	defer srv.Close()
+func TestSpreadMetricFromRecordedBook(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
 
-	m := SpreadMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
-	r := RunMetric(ctx(), m, Subject{
+	spread := SpreadMetric{DEX: c}
+	r := RunMetric(ctx(), spread, Subject{
 		Send:    asset.Native(),
 		Receive: asset.NGNC(),
 	})
@@ -798,14 +803,11 @@ func TestSpreadMetricFromRecordedBook(t *testing.T) {
 }
 
 func TestSpreadMetricEmptyBook(t *testing.T) {
-	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/hal+json")
-		w.Write([]byte(`{"bids":[],"asks":[]}`))
-	}))
-	defer bookServer.Close()
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook-empty")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
 
-	m := SpreadMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
-	r := RunMetric(ctx(), m, Subject{
+	spread := SpreadMetric{DEX: c}
+	r := RunMetric(ctx(), spread, Subject{
 		Send:    asset.Native(),
 		Receive: asset.NGNC(),
 	})
@@ -819,14 +821,11 @@ func TestSpreadMetricEmptyBook(t *testing.T) {
 }
 
 func TestSpreadMetricOneSidedBook(t *testing.T) {
-	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/hal+json")
-		w.Write([]byte(`{"bids":[],"asks":[{"price":"100","amount":"10"}]}`))
-	}))
-	defer bookServer.Close()
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook-onesided")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
 
-	m := SpreadMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
-	r := RunMetric(ctx(), m, Subject{
+	spread := SpreadMetric{DEX: c}
+	r := RunMetric(ctx(), spread, Subject{
 		Send:    asset.Native(),
 		Receive: asset.NGNC(),
 	})
@@ -840,8 +839,8 @@ func TestSpreadMetricOneSidedBook(t *testing.T) {
 }
 
 func TestSpreadMetricNilDEX(t *testing.T) {
-	m := SpreadMetric{DEX: nil}
-	r := RunMetric(ctx(), m, Subject{
+	spread := SpreadMetric{DEX: nil}
+	r := RunMetric(ctx(), spread, Subject{
 		Send:    asset.Native(),
 		Receive: asset.NGNC(),
 	})
@@ -852,8 +851,8 @@ func TestSpreadMetricNilDEX(t *testing.T) {
 }
 
 func TestSpreadMetricEmptySubject(t *testing.T) {
-	m := SpreadMetric{DEX: &dex.Client{HorizonURL: "http://example.invalid"}}
-	r := RunMetric(ctx(), m, Subject{})
+	spread := SpreadMetric{DEX: &dex.Client{HorizonURL: "http://example.invalid"}}
+	r := RunMetric(ctx(), spread, Subject{})
 
 	if r.Determined {
 		t.Error("empty subject must produce an undetermined result")
@@ -868,20 +867,6 @@ func TestSpreadMetricDescriptorIsValid(t *testing.T) {
 }
 
 // depth metric ------------------------------------------------------------------
-
-// loadOrderBookSnapshot loads a snapshot from checks/testdata/snapshots by prefix.
-func loadOrderBookSnapshot(t *testing.T, prefix string) *snapshot.Manifest {
-	t.Helper()
-	matches, err := filepath.Glob(filepath.Join("testdata/snapshots", prefix+"-*"))
-	if err != nil || len(matches) == 0 {
-		t.Fatalf("no snapshot matching %q under testdata/snapshots (err=%v)", prefix, err)
-	}
-	sm, err := snapshot.Load(matches[0])
-	if err != nil {
-		t.Fatalf("loading snapshot %s: %v", matches[0], err)
-	}
-	return sm
-}
 
 func TestDepthObservedMetric(t *testing.T) {
 	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
@@ -944,11 +929,146 @@ func TestDepthNoPathsProducesUndetermined(t *testing.T) {
 	if r.Determined {
 		t.Error("no paths must produce an undetermined result")
 	}
+	want := "no path found at any of the 1 sizes probed"
+	if r.Reason != want {
+		t.Errorf("Reason = %q, want %q", r.Reason, want)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("expected at least one evidence entry explaining the failure")
+	} else {
+		e := r.Evidence[0]
+		if !strings.Contains(e.Observed, "probed 1 sizes, no path found") {
+			t.Errorf("Evidence[0].Observed = %q, want it to contain 'probed 1 sizes, no path found'", e.Observed)
+		}
+		if e.Source == "" {
+			t.Error("Evidence[0].Source is blank — a metric must name its data source")
+		}
+		if e.ObservedAt.IsZero() {
+			t.Error("Evidence[0].ObservedAt is zero — a metric must timestamp its observation")
+		}
+	}
 }
 
 func TestDepthMetricDescriptorIsValid(t *testing.T) {
 	d := DepthMetric{}.Describe()
 	if err := d.Validate(); err != nil {
 		t.Errorf("depth metric descriptor: %v", err)
+	}
+}
+
+// RunMetric validation tests ---------------------------------------------------
+
+// panicMetric is a metric whose Describe method panics.
+type panicMetric struct{}
+
+func (panicMetric) Describe() Descriptor { panic("boom") }
+func (panicMetric) Run(context.Context, Subject) MetricResult {
+	return MetricValue(Descriptor{ID: "never"}, Subject{}, decimal.Zero, UnitPercent, "never reached")
+}
+
+func TestRunMetricDescribePanic(t *testing.T) {
+	r := RunMetric(ctx(), panicMetric{}, Subject{Domain: "example.test"})
+	if r.Determined {
+		t.Error("a metric whose Describe panics must produce an undetermined result")
+	}
+	if !strings.Contains(r.Reason, "panicked") {
+		t.Errorf("reason = %q, want it to mention the panic", r.Reason)
+	}
+}
+
+// evidenceBlankSource is a metric that returns determined with blank Source.
+type evidenceBlankSource struct{}
+
+func (evidenceBlankSource) Describe() Descriptor {
+	return Descriptor{ID: "test.blank-source", Title: "blank source", CanDetermine: "always", CannotDetermine: "never"}
+}
+func (evidenceBlankSource) Run(context.Context, Subject) MetricResult {
+	return MetricValue(
+		Descriptor{ID: "test.blank-source"},
+		Subject{},
+		decimal.NewFromInt(42), UnitCount, "ok",
+		Evidence{Source: "", Observed: "something", ObservedAt: time.Now().UTC()},
+	)
+}
+
+func TestRunMetricBlankSourceProducesUndetermined(t *testing.T) {
+	r := RunMetric(ctx(), evidenceBlankSource{}, Subject{})
+	if r.Determined {
+		t.Error("blank Source must produce an undetermined result")
+	}
+	if !strings.Contains(r.Reason, "Source") {
+		t.Errorf("reason = %q, want it to mention Source", r.Reason)
+	}
+}
+
+// evidenceBlankObserved is a metric that returns determined with blank Observed.
+type evidenceBlankObserved struct{}
+
+func (evidenceBlankObserved) Describe() Descriptor {
+	return Descriptor{ID: "test.blank-observed", Title: "blank observed", CanDetermine: "always", CannotDetermine: "never"}
+}
+func (evidenceBlankObserved) Run(context.Context, Subject) MetricResult {
+	return MetricValue(
+		Descriptor{ID: "test.blank-observed"},
+		Subject{},
+		decimal.NewFromInt(42), UnitCount, "ok",
+		Evidence{Source: "somewhere", Observed: "", ObservedAt: time.Now().UTC()},
+	)
+}
+
+func TestRunMetricBlankObservedProducesUndetermined(t *testing.T) {
+	r := RunMetric(ctx(), evidenceBlankObserved{}, Subject{})
+	if r.Determined {
+		t.Error("blank Observed must produce an undetermined result")
+	}
+	if !strings.Contains(r.Reason, "Observed") {
+		t.Errorf("reason = %q, want it to mention Observed", r.Reason)
+	}
+}
+
+// evidenceZeroTime is a metric that returns determined with zero ObservedAt.
+type evidenceZeroTime struct{}
+
+func (evidenceZeroTime) Describe() Descriptor {
+	return Descriptor{ID: "test.zero-time", Title: "zero time", CanDetermine: "always", CannotDetermine: "never"}
+}
+func (evidenceZeroTime) Run(context.Context, Subject) MetricResult {
+	return MetricValue(
+		Descriptor{ID: "test.zero-time"},
+		Subject{},
+		decimal.NewFromInt(42), UnitCount, "ok",
+		Evidence{Source: "somewhere", Observed: "something", ObservedAt: time.Time{}},
+	)
+}
+
+func TestRunMetricZeroObservedAtProducesUndetermined(t *testing.T) {
+	r := RunMetric(ctx(), evidenceZeroTime{}, Subject{})
+	if r.Determined {
+		t.Error("zero ObservedAt must produce an undetermined result")
+	}
+	if !strings.Contains(r.Reason, "ObservedAt") {
+		t.Errorf("reason = %q, want it to mention ObservedAt", r.Reason)
+	}
+}
+
+// evidenceValid is a metric with perfectly valid evidence — ensures no false rejections.
+type evidenceValid struct{}
+
+func (evidenceValid) Describe() Descriptor {
+	return Descriptor{ID: "test.valid", Title: "valid", CanDetermine: "always", CannotDetermine: "never"}
+}
+func (evidenceValid) Run(context.Context, Subject) MetricResult {
+	return MetricValue(
+		Descriptor{ID: "test.valid"},
+		Subject{},
+		decimal.NewFromInt(42), UnitCount, "ok",
+		Evidence{Source: "somewhere", Observed: "something", ObservedAt: time.Now().UTC()},
+	)
+}
+
+func TestRunMetricValidEvidence(t *testing.T) {
+	r := RunMetric(ctx(), evidenceValid{}, Subject{})
+	if !r.Determined {
+		t.Errorf("valid evidence should produce a determined result, got reason: %s", r.Reason)
 	}
 }
