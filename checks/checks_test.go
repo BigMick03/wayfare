@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/Wayfare-labs/wayfare/anchor"
 	"github.com/Wayfare-labs/wayfare/asset"
 	"github.com/Wayfare-labs/wayfare/dex"
+	"github.com/Wayfare-labs/wayfare/snapshot"
 )
 
 func ctx() context.Context { return context.Background() }
@@ -867,34 +869,26 @@ func TestSpreadMetricDescriptorIsValid(t *testing.T) {
 
 // depth metric ------------------------------------------------------------------
 
-// horizonStub is a minimal test server that returns a canned response.
-func horizonStub(t *testing.T, body string) *httptest.Server {
+// loadOrderBookSnapshot loads a snapshot from checks/testdata/snapshots by prefix.
+func loadOrderBookSnapshot(t *testing.T, prefix string) *snapshot.Manifest {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(body))
-	}))
-}
-
-// ngncStrictSendResponse is the real Horizon body for USDC -> NGNC.
-func ngncStrictSendResponse() string {
-	return `{"_embedded":{"records":[{"source_asset_type":"credit_alphanum4","source_asset_code":"USDC","source_amount":"100.0000000","destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC","destination_amount":"65100.1379550","path":[{"asset_type":"native"}]},{"source_asset_type":"credit_alphanum4","source_asset_code":"USDC","source_amount":"100.0000000","destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC","destination_amount":"21785.7821141","path":[]}]}}`
+	matches, err := filepath.Glob(filepath.Join("testdata/snapshots", prefix+"-*"))
+	if err != nil || len(matches) == 0 {
+		t.Fatalf("no snapshot matching %q under testdata/snapshots (err=%v)", prefix, err)
+	}
+	sm, err := snapshot.Load(matches[0])
+	if err != nil {
+		t.Fatalf("loading snapshot %s: %v", matches[0], err)
+	}
+	return sm
 }
 
 func TestDepthObservedMetric(t *testing.T) {
-	raw, err := os.ReadFile("../dex/testdata/orderbook-xlm-ngnc.json")
-	if err != nil {
-		t.Fatalf("reading recorded order book: %v", err)
-	}
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/hal+json")
-		w.Write([]byte(raw))
-	}))
-	defer srv.Close()
-
-	m := DepthMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
-	r := m.RunObserved(ctx(), Subject{
+	depth := DepthMetric{DEX: c}
+	r := depth.RunObserved(ctx(), Subject{
 		Send:    asset.Native(),
 		Receive: asset.NGNC(),
 	})
@@ -911,14 +905,14 @@ func TestDepthObservedMetric(t *testing.T) {
 }
 
 func TestDepthExecutableMetric(t *testing.T) {
-	srv := horizonStub(t, ngncStrictSendResponse())
-	defer srv.Close()
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
 
-	m := DepthMetric{
-		DEX:   &dex.Client{HorizonURL: srv.URL},
+	depth := DepthMetric{
+		DEX:   c,
 		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(100)},
 	}
-	r := m.RunExecutable(ctx(), Subject{
+	r := depth.RunExecutable(ctx(), Subject{
 		Send:    asset.USDC(),
 		Receive: asset.NGNC(),
 	})
@@ -926,8 +920,8 @@ func TestDepthExecutableMetric(t *testing.T) {
 	if !r.Determined {
 		t.Fatalf("depth executable metric undetermined: %s", r.Reason)
 	}
-	if r.Unit != UnitCount {
-		t.Errorf("unit = %s, want count", r.Unit)
+	if r.Unit != UnitAmount {
+		t.Errorf("unit = %s, want amount", r.Unit)
 	}
 	if !r.Value.IsPositive() {
 		t.Errorf("executable amount = %s, want positive", r.Value)
@@ -935,14 +929,14 @@ func TestDepthExecutableMetric(t *testing.T) {
 }
 
 func TestDepthNoPathsProducesUndetermined(t *testing.T) {
-	srv := horizonStub(t, `{"_embedded":{"records":[]}}`)
-	defer srv.Close()
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-empty")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
 
-	m := DepthMetric{
-		DEX:   &dex.Client{HorizonURL: srv.URL},
+	depth := DepthMetric{
+		DEX:   c,
 		Sizes: []decimal.Decimal{decimal.NewFromInt(1)},
 	}
-	r := m.RunExecutable(ctx(), Subject{
+	r := depth.RunExecutable(ctx(), Subject{
 		Send:    asset.USDC(),
 		Receive: asset.NGNC(),
 	})
