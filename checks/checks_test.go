@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/Wayfare-labs/wayfare/anchor"
 	"github.com/Wayfare-labs/wayfare/asset"
 	"github.com/Wayfare-labs/wayfare/dex"
@@ -860,6 +862,100 @@ func TestSpreadMetricDescriptorIsValid(t *testing.T) {
 	d := SpreadMetric{}.Describe()
 	if err := d.Validate(); err != nil {
 		t.Errorf("spread metric descriptor: %v", err)
+	}
+}
+
+// depth metric ------------------------------------------------------------------
+
+// horizonStub is a minimal test server that returns a canned response.
+func horizonStub(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(body))
+	}))
+}
+
+// ngncStrictSendResponse is the real Horizon body for USDC -> NGNC.
+func ngncStrictSendResponse() string {
+	return `{"_embedded":{"records":[{"source_asset_type":"credit_alphanum4","source_asset_code":"USDC","source_amount":"100.0000000","destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC","destination_amount":"65100.1379550","path":[{"asset_type":"native"}]},{"source_asset_type":"credit_alphanum4","source_asset_code":"USDC","source_amount":"100.0000000","destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC","destination_amount":"21785.7821141","path":[]}]}}`
+}
+
+func TestDepthObservedMetric(t *testing.T) {
+	raw, err := os.ReadFile("../dex/testdata/orderbook-xlm-ngnc.json")
+	if err != nil {
+		t.Fatalf("reading recorded order book: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(raw))
+	}))
+	defer srv.Close()
+
+	m := DepthMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
+	r := m.RunObserved(ctx(), Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("depth observed metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitCount {
+		t.Errorf("unit = %s, want count", r.Unit)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("level count = %s, want positive on a real book", r.Value)
+	}
+}
+
+func TestDepthExecutableMetric(t *testing.T) {
+	srv := horizonStub(t, ngncStrictSendResponse())
+	defer srv.Close()
+
+	m := DepthMetric{
+		DEX:   &dex.Client{HorizonURL: srv.URL},
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(100)},
+	}
+	r := m.RunExecutable(ctx(), Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("depth executable metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitCount {
+		t.Errorf("unit = %s, want count", r.Unit)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("executable amount = %s, want positive", r.Value)
+	}
+}
+
+func TestDepthNoPathsProducesUndetermined(t *testing.T) {
+	srv := horizonStub(t, `{"_embedded":{"records":[]}}`)
+	defer srv.Close()
+
+	m := DepthMetric{
+		DEX:   &dex.Client{HorizonURL: srv.URL},
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1)},
+	}
+	r := m.RunExecutable(ctx(), Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("no paths must produce an undetermined result")
+	}
+}
+
+func TestDepthMetricDescriptorIsValid(t *testing.T) {
+	d := DepthMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("depth metric descriptor: %v", err)
 	}
 }
 
