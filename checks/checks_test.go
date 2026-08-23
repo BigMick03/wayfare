@@ -751,11 +751,11 @@ func TestErrorBodyIsBounded(t *testing.T) {
 			r.Determined, r.Passed)
 	}
 	for _, e := range r.Evidence {
-			if len(e.Observed) > maxErrorBody {
-				t.Errorf("evidence retained %d bytes, exceeding the %d-byte bound",
-					len(e.Observed), maxErrorBody)
-			}
+		if len(e.Observed) > maxErrorBody {
+			t.Errorf("evidence retained %d bytes, exceeding the %d-byte bound",
+				len(e.Observed), maxErrorBody)
 		}
+	}
 }
 
 // spread metric ------------------------------------------------------------------
@@ -959,3 +959,55 @@ func TestDepthMetricDescriptorIsValid(t *testing.T) {
 	}
 }
 
+// price impact metric -----------------------------------------------------------
+
+func TestPriceImpactMetric(t *testing.T) {
+	// Stub returns same data for all sizes, so impact is zero.
+	srv := horizonStub(t, ngncStrictSendResponse())
+	defer srv.Close()
+
+	m := PriceImpactMetric{
+		DEX:       &dex.Client{HorizonURL: srv.URL},
+		ProbeSize: decimal.NewFromInt(1),
+		FullSize:  decimal.NewFromInt(100),
+	}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("price impact metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitPercent {
+		t.Errorf("unit = %s, want percent", r.Unit)
+	}
+	if !r.Value.IsZero() {
+		t.Errorf("impact = %s, expected zero with fixed-response stub", r.Value)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+}
+
+func TestPriceImpactMetricNoPaths(t *testing.T) {
+	srv := horizonStub(t, `{"_embedded":{"records":[]}}`)
+	defer srv.Close()
+
+	m := PriceImpactMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("no paths must produce an undetermined result")
+	}
+}
+
+func TestPriceImpactMetricDescriptorIsValid(t *testing.T) {
+	d := PriceImpactMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("price impact metric descriptor: %v", err)
+	}
+}

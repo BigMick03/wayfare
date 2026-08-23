@@ -53,10 +53,10 @@ func (DepthMetric) Describe() Descriptor {
 // RunObserved returns the observed depth metric from the order book.
 func (m DepthMetric) RunObserved(ctx context.Context, s Subject) MetricResult {
 	d := Descriptor{
-		ID:    "depth.observed",
-		Scope: ScopeCorridor,
-		Cost:  CostOneRequest,
-		Title: "Observed order book depth",
+		ID:           "depth.observed",
+		Scope:        ScopeCorridor,
+		Cost:         CostOneRequest,
+		Title:        "Observed order book depth",
 		CanDetermine: "The number of bid and ask levels on the direct order book.",
 		CannotDetermine: "Whether those levels represent executable liquidity " +
 			"or stale offers.",
