@@ -168,7 +168,47 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 	// is the only composition point and branches on nothing — see the
 	// composition rule in docs/checks.md.
 	if s.Checks != nil {
-		out = route.WithFindings(out, s.Checks.ForAsset(ctx, recvAsset))
+		f := s.Checks.ForAsset(ctx, recvAsset)
+
+		// Metrics run alongside checks after the measurement completes.
+		// They add measured quantities to the same findings block without
+		// altering any headline fields — the composition rule applies to
+		// metrics identically to checks.
+		if s.Engine.DEX != nil {
+			// Spread: bid/ask spread on the direct order book.
+			spread := checks.SpreadMetric{DEX: s.Engine.DEX}
+			f.AddMetric(checks.RunMetric(ctx, spread, checks.Subject{
+				Send:    sendAsset,
+				Receive: recvAsset,
+			}))
+
+			// Concentration: liquidity concentration across price levels.
+			conc := checks.ConcentrationMetric{DEX: s.Engine.DEX}
+			f.AddMetric(checks.RunMetric(ctx, conc, checks.Subject{
+				Send:    sendAsset,
+				Receive: recvAsset,
+			}))
+
+			// Price impact: degradation between probe and full size.
+			impact := checks.PriceImpactMetric{DEX: s.Engine.DEX}
+			f.AddMetric(checks.RunMetric(ctx, impact, checks.Subject{
+				Send:    sendAsset,
+				Receive: recvAsset,
+			}))
+
+			// Depth: observed and executable depth.
+			depth := checks.DepthMetric{DEX: s.Engine.DEX}
+			f.AddMetric(depth.RunObserved(ctx, checks.Subject{
+				Send:    sendAsset,
+				Receive: recvAsset,
+			}))
+			f.AddMetric(depth.RunExecutable(ctx, checks.Subject{
+				Send:    sendAsset,
+				Receive: recvAsset,
+			}))
+		}
+
+		out = route.WithFindings(out, f)
 	}
 
 	writeJSON(w, http.StatusOK, out)

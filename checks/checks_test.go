@@ -6,15 +6,45 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/Wayfare-labs/wayfare/anchor"
 	"github.com/Wayfare-labs/wayfare/asset"
+	"github.com/Wayfare-labs/wayfare/dex"
 )
 
 func ctx() context.Context { return context.Background() }
+
+// decFromString is a test helper that builds a decimal from a string.
+// It mirrors the dex_test helper to avoid importing test-only code.
+func decFromString(t *testing.T, s string) decimal.Decimal {
+	t.Helper()
+	d, err := decimal.NewFromString(s)
+	if err != nil {
+		t.Fatalf("decFromString(%q): %v", s, err)
+	}
+	return d
+}
+
+// horizonStub is a minimal test server that returns a canned Horizon response.
+func horizonStub(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(body))
+	}))
+}
+
+// ngncStrictSendResponse is the actual Horizon body for USDC -> NGNC,
+// mainnet, 2026-08-04. The XLM-bridged path pays 65,100 NGNC.
+func ngncStrictSendResponse() string {
+	return `{"_embedded":{"records":[{"source_asset_type":"credit_alphanum4","source_asset_code":"USDC","source_amount":"100.0000000","destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC","destination_amount":"65100.1379550","path":[{"asset_type":"native"}]},{"source_asset_type":"credit_alphanum4","source_asset_code":"USDC","source_amount":"100.0000000","destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC","destination_amount":"21785.7821141","path":[]}]}}`
+}
 
 // profileWith builds a resolved anchor profile from currency entries.
 func profileWith(domain string, cs ...anchor.Currency) *anchor.Profile {
@@ -753,3 +783,336 @@ func TestErrorBodyIsBounded(t *testing.T) {
 		}
 	}
 }
+
+// spread metric ------------------------------------------------------------------
+
+func TestSpreadMetricFromRecordedBook(t *testing.T) {
+	// Read the real XLM/NGNC order book captured from mainnet.
+	raw, err := os.ReadFile("../dex/testdata/orderbook-xlm-ngnc.json")
+	if err != nil {
+		t.Fatalf("reading recorded order book: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(raw))
+	}))
+	defer srv.Close()
+
+	m := SpreadMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("spread metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitPercent {
+		t.Errorf("unit = %s, want percent", r.Unit)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("spread = %s, want positive on a real book", r.Value)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+	if r.Summary == "" {
+		t.Error("summary is empty")
+	}
+}
+
+func TestSpreadMetricEmptyBook(t *testing.T) {
+	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(`{"bids":[],"asks":[]}`))
+	}))
+	defer bookServer.Close()
+
+	m := SpreadMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("empty book must produce an undetermined result, not a zero spread")
+	}
+	if !strings.Contains(r.Reason, "empty") {
+		t.Errorf("reason = %q, want it to name the empty book", r.Reason)
+	}
+}
+
+func TestSpreadMetricOneSidedBook(t *testing.T) {
+	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(`{"bids":[],"asks":[{"price":"100","amount":"10"}]}`))
+	}))
+	defer bookServer.Close()
+
+	m := SpreadMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("one-sided book must produce an undetermined result")
+	}
+	if !strings.Contains(r.Reason, "nobody is buying") {
+		t.Errorf("reason = %q, want it to name the missing side", r.Reason)
+	}
+}
+
+func TestSpreadMetricNilDEX(t *testing.T) {
+	m := SpreadMetric{DEX: nil}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("nil DEX client must produce an undetermined result")
+	}
+}
+
+func TestSpreadMetricEmptySubject(t *testing.T) {
+	m := SpreadMetric{DEX: &dex.Client{HorizonURL: "http://example.invalid"}}
+	r := RunMetric(ctx(), m, Subject{})
+
+	if r.Determined {
+		t.Error("empty subject must produce an undetermined result")
+	}
+}
+
+func TestSpreadMetricDescriptorIsValid(t *testing.T) {
+	d := SpreadMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("spread metric descriptor: %v", err)
+	}
+}
+
+// concentration metric -----------------------------------------------------------
+
+func TestConcentrationMetricFromRecordedBook(t *testing.T) {
+	raw, err := os.ReadFile("../dex/testdata/orderbook-xlm-ngnc.json")
+	if err != nil {
+		t.Fatalf("reading recorded order book: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(raw))
+	}))
+	defer srv.Close()
+
+	m := ConcentrationMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("concentration metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitRatio {
+		t.Errorf("unit = %s, want ratio", r.Unit)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("HHI = %s, want positive", r.Value)
+	}
+	// HHI must be between 0 and 1 inclusive
+	if r.Value.GreaterThan(decFromString(t, "1")) {
+		t.Errorf("HHI = %s, want <= 1.0", r.Value)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+}
+
+func TestConcentrationMetricEmptyBook(t *testing.T) {
+	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(`{"bids":[],"asks":[]}`))
+	}))
+	defer bookServer.Close()
+
+	m := ConcentrationMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("empty book must produce an undetermined result")
+	}
+}
+
+func TestConcentrationMetricSingleOffer(t *testing.T) {
+	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(`{"bids":[{"price":"100","amount":"50"}],"asks":[{"price":"101","amount":"50"}]}`))
+	}))
+	defer bookServer.Close()
+
+	m := ConcentrationMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("single offer book should produce a determined result: %s", r.Reason)
+	}
+	// With 2 levels total (1 bid + 1 ask), HHI = 1/2 = 0.5
+	if got := r.Value.StringFixed(2); got != "0.50" {
+		t.Errorf("HHI = %s, want 0.50 (2 levels: 1 bid + 1 ask)", r.Value)
+	}
+}
+
+func TestConcentrationMetricDescriptorIsValid(t *testing.T) {
+	d := ConcentrationMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("concentration metric descriptor: %v", err)
+	}
+}
+
+// price impact metric -----------------------------------------------------------
+
+func TestPriceImpactMetric(t *testing.T) {
+	// The stub returns the same response for all sizes (it cannot vary by
+	// source_amount), so the rates are identical and impact is zero. This
+	// tests that the metric computes without error and returns a determined
+	// result with correct structure.
+	srv := horizonStub(t, ngncStrictSendResponse())
+	defer srv.Close()
+
+	m := PriceImpactMetric{
+		DEX:       &dex.Client{HorizonURL: srv.URL},
+		ProbeSize: decimal.NewFromInt(1),
+		FullSize:  decimal.NewFromInt(100),
+	}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("price impact metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitPercent {
+		t.Errorf("unit = %s, want percent", r.Unit)
+	}
+	// Stub returns same data for all sizes, so impact is zero.
+	if !r.Value.IsZero() {
+		t.Errorf("impact = %s, expected zero with a fixed-response stub", r.Value)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+}
+
+func TestPriceImpactMetricNoPaths(t *testing.T) {
+	srv := horizonStub(t, `{"_embedded":{"records":[]}}`)
+	defer srv.Close()
+
+	m := PriceImpactMetric{
+		DEX: &dex.Client{HorizonURL: srv.URL},
+	}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("no paths must produce an undetermined result")
+	}
+}
+
+func TestPriceImpactMetricDescriptorIsValid(t *testing.T) {
+	d := PriceImpactMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("price impact metric descriptor: %v", err)
+	}
+}
+
+// depth metric ------------------------------------------------------------------
+
+func TestDepthObservedMetric(t *testing.T) {
+	raw, err := os.ReadFile("../dex/testdata/orderbook-xlm-ngnc.json")
+	if err != nil {
+		t.Fatalf("reading recorded order book: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(raw))
+	}))
+	defer srv.Close()
+
+	m := DepthMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
+	r := m.RunObserved(ctx(), Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("depth observed metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitCount {
+		t.Errorf("unit = %s, want count", r.Unit)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("level count = %s, want positive on a real book", r.Value)
+	}
+}
+
+func TestDepthExecutableMetric(t *testing.T) {
+	srv := horizonStub(t, ngncStrictSendResponse())
+	defer srv.Close()
+
+	m := DepthMetric{
+		DEX:   &dex.Client{HorizonURL: srv.URL},
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(100)},
+	}
+	r := m.RunExecutable(ctx(), Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("depth executable metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitCount {
+		t.Errorf("unit = %s, want count", r.Unit)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("executable amount = %s, want positive", r.Value)
+	}
+}
+
+func TestDepthNoPathsProducesUndetermined(t *testing.T) {
+	srv := horizonStub(t, `{"_embedded":{"records":[]}}`)
+	defer srv.Close()
+
+	m := DepthMetric{
+		DEX:   &dex.Client{HorizonURL: srv.URL},
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1)},
+	}
+	r := m.RunExecutable(ctx(), Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("no paths must produce an undetermined result")
+	}
+}
+
+func TestDepthMetricDescriptorIsValid(t *testing.T) {
+	d := DepthMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("depth metric descriptor: %v", err)
+	}
+}
+
