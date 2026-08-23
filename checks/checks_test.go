@@ -751,11 +751,11 @@ func TestErrorBodyIsBounded(t *testing.T) {
 			r.Determined, r.Passed)
 	}
 	for _, e := range r.Evidence {
-			if len(e.Observed) > maxErrorBody {
-				t.Errorf("evidence retained %d bytes, exceeding the %d-byte bound",
-					len(e.Observed), maxErrorBody)
-			}
+		if len(e.Observed) > maxErrorBody {
+			t.Errorf("evidence retained %d bytes, exceeding the %d-byte bound",
+				len(e.Observed), maxErrorBody)
 		}
+	}
 }
 
 // spread metric ------------------------------------------------------------------
@@ -1012,3 +1012,86 @@ func TestPriceImpactMetricDescriptorIsValid(t *testing.T) {
 	}
 }
 
+// concentration metric -----------------------------------------------------------
+
+func TestConcentrationMetricFromRecordedBook(t *testing.T) {
+	raw, err := os.ReadFile("../dex/testdata/orderbook-xlm-ngnc.json")
+	if err != nil {
+		t.Fatalf("reading recorded order book: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(raw))
+	}))
+	defer srv.Close()
+
+	m := ConcentrationMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("concentration metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitRatio {
+		t.Errorf("unit = %s, want ratio", r.Unit)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("HHI = %s, want positive", r.Value)
+	}
+	if r.Value.GreaterThan(decimal.NewFromInt(1)) {
+		t.Errorf("HHI = %s, want <= 1.0", r.Value)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+}
+
+func TestConcentrationMetricEmptyBook(t *testing.T) {
+	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(`{"bids":[],"asks":[]}`))
+	}))
+	defer bookServer.Close()
+
+	m := ConcentrationMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("empty book must produce an undetermined result")
+	}
+}
+
+func TestConcentrationMetricSingleOffer(t *testing.T) {
+	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(`{"bids":[{"price":"100","amount":"50"}],"asks":[{"price":"101","amount":"50"}]}`))
+	}))
+	defer bookServer.Close()
+
+	m := ConcentrationMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("single offer book should produce a determined result: %s", r.Reason)
+	}
+	// 2 levels total, HHI = 1/2 = 0.5
+	if got := r.Value.StringFixed(2); got != "0.50" {
+		t.Errorf("HHI = %s, want 0.50 (2 levels)", r.Value)
+	}
+}
+
+func TestConcentrationMetricDescriptorIsValid(t *testing.T) {
+	d := ConcentrationMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("concentration metric descriptor: %v", err)
+	}
+}
