@@ -6,12 +6,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Wayfare-labs/wayfare/anchor"
 	"github.com/Wayfare-labs/wayfare/asset"
+	"github.com/Wayfare-labs/wayfare/dex"
 )
 
 func ctx() context.Context { return context.Background() }
@@ -751,5 +753,112 @@ func TestErrorBodyIsBounded(t *testing.T) {
 			t.Errorf("evidence retained %d bytes, exceeding the %d-byte bound",
 				len(e.Observed), maxErrorBody)
 		}
+	}
+}
+
+// spread metric ------------------------------------------------------------------
+
+func TestSpreadMetricFromRecordedBook(t *testing.T) {
+	raw, err := os.ReadFile("../dex/testdata/orderbook-xlm-ngnc.json")
+	if err != nil {
+		t.Fatalf("reading recorded order book: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(raw))
+	}))
+	defer srv.Close()
+
+	m := SpreadMetric{DEX: &dex.Client{HorizonURL: srv.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("spread metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitPercent {
+		t.Errorf("unit = %s, want percent", r.Unit)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("spread = %s, want positive on a real book", r.Value)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+	if r.Summary == "" {
+		t.Error("summary is empty")
+	}
+}
+
+func TestSpreadMetricEmptyBook(t *testing.T) {
+	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(`{"bids":[],"asks":[]}`))
+	}))
+	defer bookServer.Close()
+
+	m := SpreadMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("empty book must produce an undetermined result, not a zero spread")
+	}
+	if !strings.Contains(r.Reason, "empty") {
+		t.Errorf("reason = %q, want it to name the empty book", r.Reason)
+	}
+}
+
+func TestSpreadMetricOneSidedBook(t *testing.T) {
+	bookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.Write([]byte(`{"bids":[],"asks":[{"price":"100","amount":"10"}]}`))
+	}))
+	defer bookServer.Close()
+
+	m := SpreadMetric{DEX: &dex.Client{HorizonURL: bookServer.URL}}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("one-sided book must produce an undetermined result")
+	}
+	if !strings.Contains(r.Reason, "nobody is buying") {
+		t.Errorf("reason = %q, want it to name the missing side", r.Reason)
+	}
+}
+
+func TestSpreadMetricNilDEX(t *testing.T) {
+	m := SpreadMetric{DEX: nil}
+	r := RunMetric(ctx(), m, Subject{
+		Send:    asset.Native(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("nil DEX client must produce an undetermined result")
+	}
+}
+
+func TestSpreadMetricEmptySubject(t *testing.T) {
+	m := SpreadMetric{DEX: &dex.Client{HorizonURL: "http://example.invalid"}}
+	r := RunMetric(ctx(), m, Subject{})
+
+	if r.Determined {
+		t.Error("empty subject must produce an undetermined result")
+	}
+}
+
+func TestSpreadMetricDescriptorIsValid(t *testing.T) {
+	d := SpreadMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("spread metric descriptor: %v", err)
 	}
 }
