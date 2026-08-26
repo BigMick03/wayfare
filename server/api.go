@@ -352,8 +352,12 @@ func staleJSON(rec *runstore.Record, pair string, now time.Time) route.CorridorJ
 		},
 	}
 
+	// DependsOn entries are stored as codes alone, but an asset code
+	// identifies nothing — the issuer is the identity — so each is resolved
+	// back through the verified registry to carry the same identity the
+	// live document did. See assetFromStoredCode.
 	for _, code := range rec.DependsOn {
-		out.DependsOn = append(out.DependsOn, route.AssetJSON{Code: code})
+		out.DependsOn = append(out.DependsOn, assetFromStoredCode(code))
 	}
 	for _, r := range rec.Rungs {
 		rj := route.RungJSON{
@@ -472,16 +476,29 @@ func severityName(rank int) string {
 	}
 }
 
+// assetFromStoredCode resolves a stored asset code to its verified wire
+// identity, or reports the bare code when the registry does not know it.
+//
+// Backlog #8: a code identifies nothing, and the issuer is the identity, so
+// a document rebuilt from storage must carry the issuer the live one did.
+// Resolving through the registry is reconstruction, not synthesis: a code
+// only reaches DependsOn by being a registered fiat token — classify()
+// counts exactly those — so this recovers the identity that was measured.
+// A code the registry does not know stays a bare code; no issuer is guessed.
+func assetFromStoredCode(code string) route.AssetJSON {
+	if a, ok := asset.Lookup(code); ok {
+		return route.ToAssetJSON(a)
+	}
+	return route.AssetJSON{Code: code}
+}
+
 // assetFromCode splits a stored corridor key like "USDC-NGNC".
 func assetFromCode(corridor string, idx int) route.AssetJSON {
 	parts := strings.SplitN(corridor, "-", 2)
 	if idx >= len(parts) {
 		return route.AssetJSON{}
 	}
-	if a, ok := asset.Lookup(parts[idx]); ok {
-		return route.ToAssetJSON(a)
-	}
-	return route.AssetJSON{Code: parts[idx]}
+	return assetFromStoredCode(parts[idx])
 }
 
 // humanAge renders a duration the way a reader thinks about staleness.

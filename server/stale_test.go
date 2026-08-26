@@ -11,6 +11,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/Wayfare-labs/wayfare/asset"
 	"github.com/Wayfare-labs/wayfare/refrate"
 	"github.com/Wayfare-labs/wayfare/route"
 	"github.com/Wayfare-labs/wayfare/runstore"
@@ -117,6 +118,58 @@ func TestStaleReadingIsLabelled(t *testing.T) {
 	}
 	if body["recommended"] != nil {
 		t.Error("a stored null recommendation must stay null on the stale path")
+	}
+}
+
+// TestStaleDependsOnCarriesIssuerIdentity covers backlog #8: staleJSON used
+// to rebuild depends_on from stored codes alone, dropping the issuer — the
+// identity — from every history-served reading. A document served from
+// storage must carry the same asset identity the live document does,
+// resolved through the verified registry.
+//
+// Scope: tests plus the staleJSON fix only; no record-layout change. The
+// registry is the same one classify() used to decide the dependency existed,
+// so resolving through it recovers the measured identity rather than
+// synthesising one.
+func TestStaleDependsOnCarriesIssuerIdentity(t *testing.T) {
+	rec := &runstore.Record{
+		RecordedAt: time.Now().UTC().Add(-time.Hour),
+		Corridor:   "USDC-GHSC",
+		Integrity:  "DERIVATIVE",
+		DependsOn:  []string{"NGNC"},
+	}
+
+	out := staleJSON(rec, "USD/GHS", time.Now().UTC())
+
+	if len(out.DependsOn) != 1 {
+		t.Fatalf("DependsOn = %v, want exactly NGNC with its issuer", out.DependsOn)
+	}
+	got := out.DependsOn[0]
+	if got.Code != "NGNC" || got.Issuer != asset.LinkIOIssuer || got.Peg != "NGN" {
+		t.Errorf("stale depends_on = %+v, want {NGNC %s NGN} — a code alone "+
+			"identifies nothing, the issuer is the identity", got, asset.LinkIOIssuer)
+	}
+}
+
+// TestStaleDependsOnUnknownCodeStaysBare pins the other side of the same
+// rule: a dependency code the registry does not know stays a bare code,
+// never a guessed issuer. Reconstructing identity is only legitimate when
+// the identity is verified.
+func TestStaleDependsOnUnknownCodeStaysBare(t *testing.T) {
+	rec := &runstore.Record{
+		RecordedAt: time.Now().UTC().Add(-time.Hour),
+		Corridor:   "USDC-NGNC",
+		Integrity:  "DERIVATIVE",
+		DependsOn:  []string{"NGNC", "NOTAKEN"},
+	}
+
+	out := staleJSON(rec, "USD/NGN", time.Now().UTC())
+
+	if len(out.DependsOn) != 2 {
+		t.Fatalf("DependsOn = %v, want both stored codes", out.DependsOn)
+	}
+	if got := out.DependsOn[1]; got.Code != "NOTAKEN" || got.Issuer != "" || got.Peg != "" {
+		t.Errorf("an unregistered code must stay a bare code, got %+v", got)
 	}
 }
 
