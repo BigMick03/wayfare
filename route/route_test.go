@@ -308,6 +308,118 @@ func TestVerdictThresholds(t *testing.T) {
 	}
 }
 
+// #12 — The recommendation rule at exactly the POOR boundary.
+//
+// Picked up from backlog #12 / issue #117. At 20.0% a quote is POOR,
+// therefore acceptable, therefore recommendable; one operator —
+// LessThanOrEqual at ThresholdPoor in verdictFor — separates "we recommend
+// this" from "we recommend nothing". The two cases below pin both sides of
+// that operator through the real engine (DEX pricing, score, Acceptable and
+// the recommendation selection), so a mutation anywhere in the chain breaks a
+// test instead of silently shifting the published answer.
+//
+// Scope: tests only. No verdict threshold, integrity semantics, check
+// composition rule or run-record layout is changed by this work.
+
+// boundaryEngine prices one DEX path paying destAmount NGNC for 100 USDC
+// against the given USD/NGN mid. The slippage probe is pinned to the send
+// size so no second request can perturb the fixture.
+func boundaryEngine(t *testing.T, destAmount, mid string) (*Engine, func()) {
+	t.Helper()
+	body := `{
+  "_embedded": {
+    "records": [
+      {
+        "source_asset_type": "credit_alphanum4",
+        "source_asset_code": "USDC",
+        "source_amount": "100.0000000",
+        "destination_asset_type": "credit_alphanum4",
+        "destination_asset_code": "NGNC",
+        "destination_amount": "` + destAmount + `",
+        "path": []
+      }
+    ]
+  }
+}`
+	srv := horizonStub(t, body)
+	e := &Engine{
+		DEX:         &dex.Client{HorizonURL: srv.URL},
+		RefRate:     usdToNGN(mid),
+		ProbeAmount: decimal.NewFromInt(100),
+	}
+	return e, func() { srv.Close() }
+}
+
+func TestQuoteAtExactlyPoorBoundaryIsRecommended(t *testing.T) {
+	// 120,000 NGNC for 100 USDC is an effective rate of 1,200 against a mid
+	// of 1,500 — a loss of exactly (1500-1200)/1500 = 20.0%. A grading that
+	// used LessThan at the POOR threshold would refuse this quote; this test
+	// pins the LessThanOrEqual.
+	e, close := boundaryEngine(t, "120000.0000000", "1500")
+	defer close()
+
+	res, err := e.Quote(context.Background(), ngnRequest("100"))
+	if err != nil {
+		t.Fatalf("Quote: %v", err)
+	}
+
+	q := res.Quotes[0]
+	if !q.LossPct.Equal(decimal.RequireFromString("20")) {
+		t.Fatalf("test setup is wrong: LossPct = %s, want exactly 20", q.LossPct)
+	}
+	if q.Verdict != VerdictPoor {
+		t.Fatalf("Verdict = %s, want POOR at exactly 20.0%%", q.Verdict)
+	}
+	if !q.Verdict.Acceptable() {
+		t.Fatal("POOR must be acceptable: it is the floor of the recommendation rule")
+	}
+	if res.Recommended == nil {
+		t.Fatal("a quote losing exactly 20.0%% is POOR and must be recommended; " +
+			"the boundary operator is what separates this from recommending nothing")
+	}
+	if res.Recommended.Verdict != VerdictPoor {
+		t.Errorf("Recommended.Verdict = %s, want POOR", res.Recommended.Verdict)
+	}
+	if !res.Recommended.LossPct.Equal(decimal.RequireFromString("20")) {
+		t.Errorf("Recommended.LossPct = %s, want the boundary quote's 20",
+			res.Recommended.LossPct)
+	}
+}
+
+func TestQuoteJustOverPoorBoundaryIsRefused(t *testing.T) {
+	// 119,985 NGNC for 100 USDC is an effective rate of 1,199.85 against a
+	// mid of 1,500 — a loss of exactly (1500-1199.85)/1500 = 20.01%. This is
+	// the other side of the same operator: loosening it, or admitting
+	// UNUSABLE into Acceptable, would publish a value-destroying route as a
+	// recommendation.
+	e, close := boundaryEngine(t, "119985.0000000", "1500")
+	defer close()
+
+	res, err := e.Quote(context.Background(), ngnRequest("100"))
+	if err != nil {
+		t.Fatalf("Quote: %v", err)
+	}
+
+	q := res.Quotes[0]
+	if !q.LossPct.Equal(decimal.RequireFromString("20.01")) {
+		t.Fatalf("test setup is wrong: LossPct = %s, want exactly 20.01", q.LossPct)
+	}
+	if q.Verdict != VerdictUnusable {
+		t.Fatalf("Verdict = %s, want UNUSABLE just over 20.0%%", q.Verdict)
+	}
+	if q.Verdict.Acceptable() {
+		t.Fatal("UNUSABLE must never be acceptable: recommending it would rank " +
+			"a losing route as worth taking")
+	}
+	if res.Recommended != nil {
+		t.Fatal("a quote losing 20.01%% is UNUSABLE; the engine must recommend " +
+			"nothing, never the least-bad option")
+	}
+	if res.Viable() {
+		t.Error("an all-unusable result must not report as viable")
+	}
+}
+
 // TestNoPathsProducesNoQuotes covers a corridor Horizon cannot route at all.
 func TestNoPathsProducesNoQuotes(t *testing.T) {
 	srv := horizonStub(t, `{"_embedded":{"records":[]}}`)

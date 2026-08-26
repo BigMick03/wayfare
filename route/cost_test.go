@@ -261,20 +261,28 @@ func TestCostBlockJSONShape(t *testing.T) {
 		}
 	}
 
-	// The two determined components carry amount and pct as strings; the
-	// two undetermined ones carry none, only a reason.
+	// Only fx_loss is computed from observed rates and carries amount and
+	// pct as strings; every other component is undetermined and carries
+	// none, only a reason. Fees in particular is never a determined zero:
+	// a path's operation count and the current base fee are unknown, and
+	// small is not zero (see Decompose and #96).
 	if got := componentOf(t, parts[0]); got != string(CostFXLoss) {
 		t.Fatalf("parts[0].component = %q, want %q", got, CostFXLoss)
 	}
 	assertDeterminedDecimalStrings(t, parts[0], "fx_loss")
 
-	if got := componentOf(t, parts[1]); got != string(CostFees) {
-		t.Fatalf("parts[1].component = %q, want %q", got, CostFees)
-	}
-	assertDeterminedDecimalStrings(t, parts[1], "fees")
-
-	for _, idx := range []int{2, 3} {
+	for _, idx := range []int{1, 2, 3} {
 		p := parts[idx]
+		var determined bool
+		if err := json.Unmarshal(p["determined"], &determined); err != nil {
+			t.Fatalf("component %q: determined is not a bool: %v",
+				componentOf(t, p), err)
+		}
+		if determined {
+			t.Errorf("component %q must be undetermined on the wire: nothing "+
+				"was observed or computed that establishes its value",
+				componentOf(t, p))
+		}
 		assertUndetermined(t, p)
 	}
 }
